@@ -91,33 +91,25 @@ last_name = autor_final.split()[-1].lower() if autor_final else "autor"
 cite_key = f"{last_name}{ano_fm}"
 
 # =====================================================================
-# BLOCO 4: LEITURA SEQUENCIAL SEGURO E AGRUPAMENTO
+# BLOCO 4: LEITURA SEQUENCIAL COM EXTRAÇÃO DE CAPÍTULOS
 # =====================================================================
 
-notas_processadas = []
-blocos_existentes = re.split(r'\n---\n', raw_notas)
-
-for bloco in blocos_existentes:
-    bloco = bloco.strip()
-    if not bloco: continue
-    
-    match = re.search(r'\\cite\[(?:p\.\vert{}pos\.)\s*(\d+)\]', bloco)
-    sort_val = int(match.group(1)) if match else 999999
-    notas_processadas.append({'sort_val': sort_val, 'texto': bloco})
-
-# NOVA LÓGICA DE LEITURA (Evita o erro do Marcador)
-elements = soup.find_all('div', class_=['noteHeading', 'noteText'])
+# Adicionamos 'sectionHeading' na busca para rastrear os capítulos
+elements = soup.find_all('div', class_=['sectionHeading', 'noteHeading', 'noteText'])
 parsed_items = []
 current_heading = None
+current_chapter = None
 
 for el in elements:
     classes = el.get('class', [])
-    if 'noteHeading' in classes:
-        # Pega o título e limpa caracteres invisíveis
+    if 'sectionHeading' in classes:
+        current_chapter = el.text.strip().replace('\xa0', ' ')
+    elif 'noteHeading' in classes:
         current_heading = el.text.strip().replace('\xa0', ' ')
     elif 'noteText' in classes:
         if current_heading:
             parsed_items.append({
+                'chapter': current_chapter,
                 'heading': current_heading,
                 'text': el.text.strip()
             })
@@ -126,10 +118,10 @@ for el in elements:
 entradas_agrupadas = []
 entrada_atual = None
 
-# Agora processamos os itens garantidamente alinhados
 for item in parsed_items:
     head_text = item['heading']
     content = item['text']
+    capitulo = item['chapter']
     
     page_match = re.search(r'(?i)(página|page)\s*(\d+)', head_text)
     loc_match = re.search(r'(?i)(posição|location)\s*(\d+)', head_text)
@@ -139,6 +131,8 @@ for item in parsed_items:
     
     texto_cabecalho = head_text.lower()
     is_nota = "nota" in texto_cabecalho or "note" in texto_cabecalho or "anotação" in texto_cabecalho
+    if "destaque" in texto_cabecalho or "highlight" in texto_cabecalho or "marcação" in texto_cabecalho:
+        is_nota = False
         
     if is_nota:
         if entrada_atual and entrada_atual['pagina'] == pagina_atual:
@@ -149,16 +143,41 @@ for item in parsed_items:
         else:
             if entrada_atual:
                 entradas_agrupadas.append(entrada_atual)
-            entrada_atual = {'pagina': pagina_atual, 'location_info': location_info, 'grifo': '', 'anotacao': content}
+            entrada_atual = {'pagina': pagina_atual, 'location_info': location_info, 'grifo': '', 'anotacao': content, 'capitulo': capitulo}
     else:
         if entrada_atual:
             entradas_agrupadas.append(entrada_atual)
-        entrada_atual = {'pagina': pagina_atual, 'location_info': location_info, 'grifo': content, 'anotacao': ''}
+        entrada_atual = {'pagina': pagina_atual, 'location_info': location_info, 'grifo': content, 'anotacao': '', 'capitulo': capitulo}
 
 if entrada_atual:
     entradas_agrupadas.append(entrada_atual)
 
-# Transforma em Markdown
+# =====================================================================
+# BLOCO 5: CRUZAMENTO DE DADOS (NOVAS VS ANTIGAS E INJEÇÃO DE CAPÍTULO)
+# =====================================================================
+
+notas_antigas = []
+blocos_existentes = re.split(r'\n---\n', raw_notas)
+
+for bloco in blocos_existentes:
+    # Limpa capítulos antigos (se existirem) para não duplicá-los ao reconstruir
+    bloco = re.sub(r'^###\s+[^\n]+\n*', '', bloco).strip()
+    if not bloco: continue
+    
+    match = re.search(r'\\cite\[(?:p\.\vert{}pos\.)\s*(\d+)\]', bloco)
+    sort_val = int(match.group(1)) if match else 999999
+    
+    # Cruza com as entradas do Kindle para resgatar a qual capítulo esta nota antiga pertence
+    cap_found = None
+    for ent in entradas_agrupadas:
+        if (ent['grifo'] and ent['grifo'][:50] in bloco) or (ent['anotacao'] and ent['anotacao'][:50] in bloco):
+            cap_found = ent['capitulo']
+            break
+            
+    notas_antigas.append({'sort_val': sort_val, 'texto': bloco, 'capitulo': cap_found})
+
+notas_novas = []
+
 for entrada in entradas_agrupadas:
     if PAGINA_INICIAL is not None and entrada['pagina'] < PAGINA_INICIAL: continue
     if PAGINA_FINAL is not None and entrada['pagina'] > PAGINA_FINAL: continue
@@ -175,17 +194,30 @@ for entrada in entradas_agrupadas:
     
     duplicada = False
     if entrada['grifo']:
-        duplicada = any(entrada['grifo'][:50] in n['texto'] for n in notas_processadas)
+        duplicada = any(entrada['grifo'][:50] in n['texto'] for n in notas_antigas)
     elif entrada['anotacao']:
-        duplicada = any(entrada['anotacao'][:50] in n['texto'] for n in notas_processadas)
+        duplicada = any(entrada['anotacao'][:50] in n['texto'] for n in notas_antigas)
         
     if not duplicada:
-        notas_processadas.append({'sort_val': entrada['pagina'] if entrada['pagina'] > 0 else 999999, 'texto': md_nota})
+        if not any(md_nota[:100] in n['texto'] for n in notas_novas):
+            notas_novas.append({'sort_val': entrada['pagina'] if entrada['pagina'] > 0 else 999999, 'texto': md_nota})
 
-notas_processadas.sort(key=lambda x: x['sort_val'])
+# Ordenação
+notas_antigas.sort(key=lambda x: x['sort_val'])
+notas_novas.sort(key=lambda x: x['sort_val'])
+
+# Constrói o texto das notas antigas já embutindo o título do capítulo
+textos_antigas = []
+current_cap = None
+for n in notas_antigas:
+    if n.get('capitulo') and n['capitulo'] != current_cap:
+        current_cap = n['capitulo']
+        textos_antigas.append(f"### {current_cap}\n\n{n['texto']}")
+    else:
+        textos_antigas.append(n['texto'])
 
 # =====================================================================
-# BLOCO 5: RECONSTRUÇÃO DO ARQUIVO FINAL
+# BLOCO 6: RECONSTRUÇÃO DO ARQUIVO FINAL
 # =====================================================================
 
 crases = "```"
@@ -206,12 +238,14 @@ novo_conteudo += "## Bibtex:\n\n" + bibtex_block.strip() + "\n"
 novo_conteudo += meio_preservado
 novo_conteudo += "## Notas literárias:\n\n"
 
-textos_notas = [n['texto'] for n in notas_processadas]
-novo_conteudo += "\n\n---\n\n".join(textos_notas)
+# Junta primeiro as novas, depois as antigas processadas com capítulos
+todas_as_notas = [n['texto'] for n in notas_novas] + textos_antigas
+
+novo_conteudo += "\n\n---\n\n".join(todas_as_notas)
 novo_conteudo += "\n\n---\n"
 
 with open(ARQUIVO_OBSIDIAN, 'w', encoding='utf-8') as f:
     f.write(novo_conteudo)
 
-print(f"SUCESSO! O erro de deslocamento foi corrigido.")
+print(f"SUCESSO! Foram adicionadas {len(notas_novas)} notas novas no topo e as antigas foram separadas por capítulo.")
 pausar_e_sair()
